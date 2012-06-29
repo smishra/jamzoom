@@ -17,9 +17,7 @@ import org.slf4j.LoggerFactory;
 import scala.math.Ordering;
 
 import javax.xml.crypto.dsig.keyinfo.KeyInfo;
-import java.io.DataInput;
-import java.io.DataOutput;
-import java.io.IOException;
+import java.io.*;
 import java.text.DateFormat;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
@@ -39,6 +37,10 @@ public class TrafficEvaluator extends Configured implements Tool {
     @java.lang.Override
     public int run(java.lang.String[] args) throws Exception {
         Configuration conf =this.getConf();
+
+        //The first arg is the average speed data file
+        conf.set("RefSpeedDataFile", args[0]);
+
         conf.setQuietMode(false);
 
         Job job = new Job(conf, "Traffic Eye");
@@ -54,12 +56,15 @@ public class TrafficEvaluator extends Configured implements Tool {
         job.setOutputKeyClass(Text.class);
         job.setOutputValueClass(TrafficWindow.class);
 
-        for (int i= 0; i<args.length - 1; ++i) {
+
+        for (int i= 1; i<args.length - 1; ++i) {
             System.err.println(String.format("processing %d: %s", i, args[i]));
             FileInputFormat.addInputPath(job, new Path(args[i]));
         }
 
         FileOutputFormat.setOutputPath(job, new Path(args[args.length-1]));
+
+
 
         job.waitForCompletion(true);
 
@@ -105,9 +110,30 @@ class TrafficEvaluatorMapper extends Mapper<LongWritable, Text, Text, TrafficWin
 
 class TrafficEvaluatorReducer extends Reducer<Text, TrafficWindow, Text, TrafficWindow> {
     private static final long TIME_WINDOW = 5*60*1000;
+    private Map<String, Integer> refSpeedMap;
+    private String prevTmc;
 
+    @Override
     protected void reduce(Text key, java.lang.Iterable<TrafficWindow> values,
                           org.apache.hadoop.mapreduce.Reducer<Text,TrafficWindow,Text,TrafficWindow>.Context context) throws java.io.IOException, java.lang.InterruptedException {
+        if (refSpeedMap==null) {
+            String fileName = context.getConfiguration().get("RefSpeedDataFile");
+
+            Path refspeed =  new Path(fileName);
+            BufferedReader in = new BufferedReader(new InputStreamReader(refspeed.getFileSystem(context.getConfiguration()).open(refspeed)));
+
+            if (in==null) {
+                throw new RuntimeException("Can't read RefSpeedDataFile: " + fileName);
+            }
+            refSpeedMap = new HashMap<String, Integer>();
+            String line = null;
+            while ( (line=in.readLine())!=null) {
+                String[] parts = line.split(",");
+                refSpeedMap.put(parts[0], Integer.parseInt(parts[1]));
+            }
+            //System.err.println("refSpeedData: " + refSpeedMap);
+        }
+
         System.err.println("Processing tmc: " + key);
 
         Iterator<TrafficWindow> itr = values.iterator();
@@ -116,6 +142,9 @@ class TrafficEvaluatorReducer extends Reducer<Text, TrafficWindow, Text, Traffic
         int total =0;
         int count =0;
 
+        boolean flushed = false;
+
+        TrafficWindow redTW = null;
         while (itr.hasNext()) {
             TrafficWindow tw = itr.next();
             System.err.println("next entry " + tw);
@@ -125,27 +154,47 @@ class TrafficEvaluatorReducer extends Reducer<Text, TrafficWindow, Text, Traffic
                 count =0;
                 start = tw.getStartTime();
                 end = start + TIME_WINDOW;
+                redTW = new TrafficWindow(tw.getTmc(), start, end, tw.getAvgSpeed());
             }
 
             total += tw.getAvgSpeed();
             ++count;
             if (tw.getEndTime()>=end) {
-                TrafficWindow redTW = new TrafficWindow(tw.getTmc(), start, tw.getEndTime(), total/(count-1));
+                redTW.setEndTime(tw.getEndTime());
+                redTW.setAvgSpeed(total/(count-1));
+                hasBottleneck(redTW);
                 System.err.println("Reduce -> writing out: " + redTW);
                 context.write(new Text(tw.getTmc()+":"+tw.getEndTime()), redTW);
                 start = -1;
+                flushed = true;
+            }
+        }
+        if (!flushed && redTW!=null) {
+            hasBottleneck(redTW);
+            context.write(new Text(redTW.getTmc()+":"+redTW.getEndTime()), redTW);
+            flushed =true;
+            redTW =null;
+        }
+    }
+
+    private void hasBottleneck(TrafficWindow redTW) {
+        Integer refSpeed = this.refSpeedMap.get(redTW.getTmc());
+        if (refSpeed!=null) {
+            Integer variance = (15/100)*refSpeed;
+            if (redTW.getAvgSpeed()+variance<refSpeed) {
+                redTW.setBottleneck(1);
             }
         }
     }
 }
-
-
 
 class TrafficWindow implements Writable {
     private String tmc;
     private int avgSpeed;
     private long startTime;
     private long endTime;
+
+    private int bottleneck =0;
 
     public TrafficWindow() {
     }
@@ -185,6 +234,14 @@ class TrafficWindow implements Writable {
         this.endTime = endTime;
     }
 
+    public int getBottleneck() {
+        return bottleneck;
+    }
+
+    public void setBottleneck(int bottleneck) {
+        this.bottleneck = bottleneck;
+    }
+
     public boolean equals(Object o) {
         if (o instanceof TrafficWindow) {
             TrafficWindow that = (TrafficWindow)o;
@@ -201,6 +258,7 @@ class TrafficWindow implements Writable {
         WritableUtils.writeVLong(dataOutput, startTime);
         WritableUtils.writeVLong(dataOutput, endTime);
         WritableUtils.writeVInt(dataOutput, avgSpeed);
+        WritableUtils.writeVInt(dataOutput, bottleneck);
     }
 
     @Override
@@ -209,6 +267,7 @@ class TrafficWindow implements Writable {
         this.startTime = WritableUtils.readVLong(dataInput);
         this.endTime = WritableUtils.readVLong(dataInput);
         this.avgSpeed = WritableUtils.readVInt(dataInput);
+        this.bottleneck = WritableUtils.readVInt(dataInput);
     }
 
     public String getTmc() {
@@ -221,6 +280,6 @@ class TrafficWindow implements Writable {
 
     @Override
     public String toString() {
-        return this.tmc+":"+this.startTime+":"+this.endTime+":"+this.avgSpeed;
+        return this.tmc+":"+this.startTime+":"+this.endTime+":"+this.avgSpeed+":"+this.bottleneck;
     }
 }
